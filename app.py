@@ -15,7 +15,7 @@ from PIL import Image
 st.set_page_config(page_title="Bank Statement → QuickBooks", layout="wide")
 
 TEXT_MODEL = "llama-3.3-70b-versatile"
-VISION_MODEL = "llama-4-scout-17b-16e-instruct"
+VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 
 EXTRACTION_PROMPT = """You are a bank statement parser. Extract ALL transactions from this bank statement.
 
