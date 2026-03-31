@@ -8,17 +8,14 @@ import re
 import subprocess
 import os
 import time
-import google.generativeai as genai
+from groq import Groq
 from PIL import Image
 
 # ── Config ──────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Bank Statement → QuickBooks", layout="wide")
 
-AVAILABLE_MODELS = {
-    "gemini-2.0-flash-lite": "Gemini 2.0 Flash Lite (fastest, best free quota)",
-    "gemini-2.0-flash": "Gemini 2.0 Flash (better quality)",
-    "gemini-1.5-flash": "Gemini 1.5 Flash (fallback)",
-}
+TEXT_MODEL = "llama-3.3-70b-versatile"
+VISION_MODEL = "llama-4-scout-17b-16e-instruct"
 
 EXTRACTION_PROMPT = """You are a bank statement parser. Extract ALL transactions from this bank statement.
 
@@ -36,9 +33,6 @@ Rules:
 4. If the statement shows separate Debit/Credit columns, use those to determine sign.
 5. Do NOT include summary lines (beginning balance, ending balance, averages).
 6. Return ONLY the JSON array — no markdown, no explanation, no code fences."""
-
-QB_COLUMNS_BANK = ["Date", "Description", "Amount"]
-QB_COLUMNS_DETAILED = ["Date", "Description", "Amount", "Check Number", "Type"]
 
 
 def extract_text_from_pdf(pdf_file) -> str:
@@ -66,8 +60,8 @@ def extract_tables_from_pdf(pdf_file) -> str:
     return "\n\n".join(table_parts)
 
 
-def pdf_to_pil_images(pdf_bytes: bytes) -> list[Image.Image]:
-    """Convert PDF pages to PIL images using pdftoppm."""
+def pdf_to_base64_images(pdf_bytes: bytes) -> list[str]:
+    """Convert PDF pages to base64 JPEG strings."""
     tmp_dir = "/tmp/stmt_pages"
     os.makedirs(tmp_dir, exist_ok=True)
     tmp_pdf = os.path.join(tmp_dir, "input.pdf")
@@ -77,63 +71,63 @@ def pdf_to_pil_images(pdf_bytes: bytes) -> list[Image.Image]:
         ["pdftoppm", "-jpeg", "-r", "200", tmp_pdf, os.path.join(tmp_dir, "page")],
         check=True, capture_output=True,
     )
-    images = []
+    images_b64 = []
     page_files = sorted(
         f for f in os.listdir(tmp_dir) if f.startswith("page") and f.endswith(".jpg")
     )
     for pf in page_files:
         path = os.path.join(tmp_dir, pf)
-        images.append(Image.open(path).copy())
+        with open(path, "rb") as img:
+            images_b64.append(base64.standard_b64encode(img.read()).decode())
         os.remove(path)
     os.remove(tmp_pdf)
-    return images
+    return images_b64
 
 
-def parse_with_gemini_text(text: str, table_text: str, api_key: str, model_name: str) -> list[dict]:
-    """Parse transactions from extracted text via Gemini."""
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(model_name)
+def parse_with_groq_text(text: str, table_text: str, api_key: str) -> list[dict]:
+    """Parse transactions from extracted text via Groq."""
+    client = Groq(api_key=api_key)
     combined = f"EXTRACTED TEXT:\n{text}"
     if table_text.strip():
         combined += f"\n\nEXTRACTED TABLES:\n{table_text}"
 
-    for attempt in range(3):
-        try:
-            response = model.generate_content(f"{EXTRACTION_PROMPT}\n\n{combined}")
-            raw = response.text.strip()
-            raw = re.sub(r"^```(?:json)?\s*", "", raw)
-            raw = re.sub(r"\s*```$", "", raw)
-            return json.loads(raw)
-        except Exception as e:
-            if "429" in str(e) and attempt < 2:
-                time.sleep(25)
-                continue
-            raise
+    response = client.chat.completions.create(
+        model=TEXT_MODEL,
+        messages=[
+            {"role": "user", "content": f"{EXTRACTION_PROMPT}\n\n{combined}"}
+        ],
+        temperature=0,
+        max_tokens=4096,
+    )
+    raw = response.choices[0].message.content.strip()
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
+    return json.loads(raw)
 
 
-def parse_with_gemini_vision(page_images: list[Image.Image], api_key: str, model_name: str) -> list[dict]:
-    """Parse transactions from page images via Gemini vision."""
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(model_name)
+def parse_with_groq_vision(page_images_b64: list[str], api_key: str) -> list[dict]:
+    """Parse transactions from page images via Groq vision (Llama 4 Scout)."""
+    client = Groq(api_key=api_key)
 
-    content_parts = []
-    for i, img in enumerate(page_images):
-        content_parts.append(f"Page {i+1} of the bank statement:")
-        content_parts.append(img)
-    content_parts.append(EXTRACTION_PROMPT)
+    content = []
+    for i, img_b64 in enumerate(page_images_b64):
+        content.append({"type": "text", "text": f"Page {i+1} of the bank statement:"})
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
+        })
+    content.append({"type": "text", "text": EXTRACTION_PROMPT})
 
-    for attempt in range(3):
-        try:
-            response = model.generate_content(content_parts)
-            raw = response.text.strip()
-            raw = re.sub(r"^```(?:json)?\s*", "", raw)
-            raw = re.sub(r"\s*```$", "", raw)
-            return json.loads(raw)
-        except Exception as e:
-            if "429" in str(e) and attempt < 2:
-                time.sleep(25)
-                continue
-            raise
+    response = client.chat.completions.create(
+        model=VISION_MODEL,
+        messages=[{"role": "user", "content": content}],
+        temperature=0,
+        max_tokens=4096,
+    )
+    raw = response.choices[0].message.content.strip()
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
+    return json.loads(raw)
 
 
 def to_quickbooks_df(transactions: list[dict], detailed: bool = False) -> pd.DataFrame:
@@ -148,7 +142,7 @@ def to_quickbooks_df(transactions: list[dict], detailed: bool = False) -> pd.Dat
             row["Check Number"] = t.get("check_number", "") or ""
             row["Type"] = t.get("type", "Other")
         rows.append(row)
-    cols = QB_COLUMNS_DETAILED if detailed else QB_COLUMNS_BANK
+    cols = ["Date", "Description", "Amount", "Check Number", "Type"] if detailed else ["Date", "Description", "Amount"]
     return pd.DataFrame(rows, columns=cols)
 
 
@@ -165,42 +159,39 @@ def to_excel_bytes(df: pd.DataFrame) -> bytes:
 
 # ── UI ──────────────────────────────────────────────────────────────────
 st.title("🏦 Bank Statement → QuickBooks Converter")
-st.caption("Upload any bank statement PDF — text-based or scanned. Powered by Google Gemini (free tier).")
+st.caption("Upload any bank statement PDF — text-based or scanned. Powered by Groq (free, no credit card).")
 
 with st.sidebar:
     st.header("⚙️ Settings")
     api_key = st.text_input(
-        "Google Gemini API Key",
+        "Groq API Key",
         type="password",
-        help="Get free at https://aistudio.google.com/apikey",
-    )
-    selected_model = st.selectbox(
-        "Gemini Model",
-        options=list(AVAILABLE_MODELS.keys()),
-        format_func=lambda x: AVAILABLE_MODELS[x],
-        help="Try Flash Lite first — it has the best free quota. Switch if you get 429 errors.",
+        help="Get free at https://console.groq.com/keys",
     )
     detailed_export = st.checkbox("Include Check # and Type columns", value=True)
     force_vision = st.checkbox(
         "Force vision mode (use for scanned PDFs)",
         value=False,
-        help="Bypasses text extraction and sends page images directly to Gemini",
+        help="Bypasses text extraction and sends page images to Llama 4 Scout",
     )
     st.divider()
     st.markdown("""
     **💡 Free API Key**  
-    Get yours at [aistudio.google.com/apikey](https://aistudio.google.com/apikey)  
+    1. Go to [console.groq.com](https://console.groq.com)  
+    2. Sign up (Google/GitHub login)  
+    3. Go to **API Keys** → **Create**  
+    4. Paste it here  
     
-    **Troubleshooting 429 errors:**  
-    - Delete your key & create a new one  
-    - Use a personal Google account (not workspace)  
-    - Try a different model from the dropdown  
-    - Wait 30 seconds between requests  
+    **Free limits:** 30 req/min, 14,400 req/day  
+    
+    **Models used:**  
+    - Text PDFs → Llama 3.3 70B  
+    - Scanned PDFs → Llama 4 Scout (vision)  
     """)
     st.divider()
     st.markdown("""
     **QuickBooks Import Steps**  
-    1. Go to **Banking → Upload Transactions**  
+    1. **Banking → Upload Transactions**  
     2. Select your bank account  
     3. Upload the `.xlsx` or `.csv`  
     4. Map columns if prompted  
@@ -222,9 +213,9 @@ if uploaded and api_key:
             text_mode = len(pdf_text.strip()) > 50
 
     if text_mode:
-        st.info("📄 Text-based PDF detected — using text extraction + Gemini parsing.")
+        st.info(f"📄 Text-based PDF detected — using **{TEXT_MODEL}** for parsing.")
     else:
-        st.info("🖼️ Scanned/image PDF detected — using Gemini vision to read pages directly.")
+        st.info(f"🖼️ Scanned/image PDF detected — using **{VISION_MODEL}** (vision) to read pages.")
 
     col1, col2 = st.columns(2)
 
@@ -238,27 +229,24 @@ if uploaded and api_key:
             )
         else:
             with st.spinner("Rasterizing PDF pages..."):
-                page_images = pdf_to_pil_images(pdf_bytes)
-            for i, img in enumerate(page_images):
-                st.image(img, caption=f"Page {i+1}", use_container_width=True)
+                page_images_b64 = pdf_to_base64_images(pdf_bytes)
+            for i, img in enumerate(page_images_b64):
+                st.image(base64.b64decode(img), caption=f"Page {i+1}", use_container_width=True)
 
     with col2:
         st.subheader("Parsed Transactions")
-        with st.spinner("Gemini is parsing transactions..."):
+        with st.spinner("Parsing transactions..."):
             try:
                 if text_mode:
-                    transactions = parse_with_gemini_text(pdf_text, table_text, api_key, selected_model)
+                    transactions = parse_with_groq_text(pdf_text, table_text, api_key)
                 else:
-                    transactions = parse_with_gemini_vision(page_images, api_key, selected_model)
+                    transactions = parse_with_groq_vision(page_images_b64, api_key)
                 st.success(f"Extracted **{len(transactions)}** transactions")
             except json.JSONDecodeError as e:
-                st.error(f"Failed to parse Gemini's response as JSON: {e}")
+                st.error(f"Failed to parse response as JSON: {e}")
                 st.stop()
             except Exception as e:
-                if "429" in str(e):
-                    st.error(f"Rate limit hit on {selected_model}. Try selecting a different model in the sidebar, or wait 30 seconds and retry.")
-                else:
-                    st.error(f"API error: {e}")
+                st.error(f"API error: {e}")
                 st.stop()
 
         df = to_quickbooks_df(transactions, detailed=detailed_export)
@@ -293,4 +281,4 @@ if uploaded and api_key:
         )
 
 elif uploaded and not api_key:
-    st.warning("Enter your Google Gemini API key in the sidebar. Get one free at aistudio.google.com/apikey")
+    st.warning("Enter your Groq API key in the sidebar. Get one free at console.groq.com")
