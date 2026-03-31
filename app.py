@@ -7,11 +7,18 @@ import io
 import re
 import subprocess
 import os
+import time
 import google.generativeai as genai
 from PIL import Image
 
 # ── Config ──────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Bank Statement → QuickBooks", layout="wide")
+
+AVAILABLE_MODELS = {
+    "gemini-2.0-flash-lite": "Gemini 2.0 Flash Lite (fastest, best free quota)",
+    "gemini-2.0-flash": "Gemini 2.0 Flash (better quality)",
+    "gemini-1.5-flash": "Gemini 1.5 Flash (fallback)",
+}
 
 EXTRACTION_PROMPT = """You are a bank statement parser. Extract ALL transactions from this bank statement.
 
@@ -82,24 +89,32 @@ def pdf_to_pil_images(pdf_bytes: bytes) -> list[Image.Image]:
     return images
 
 
-def parse_with_gemini_text(text: str, table_text: str, api_key: str) -> list[dict]:
+def parse_with_gemini_text(text: str, table_text: str, api_key: str, model_name: str) -> list[dict]:
     """Parse transactions from extracted text via Gemini."""
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-2.0-flash")
+    model = genai.GenerativeModel(model_name)
     combined = f"EXTRACTED TEXT:\n{text}"
     if table_text.strip():
         combined += f"\n\nEXTRACTED TABLES:\n{table_text}"
-    response = model.generate_content(f"{EXTRACTION_PROMPT}\n\n{combined}")
-    raw = response.text.strip()
-    raw = re.sub(r"^```(?:json)?\s*", "", raw)
-    raw = re.sub(r"\s*```$", "", raw)
-    return json.loads(raw)
+
+    for attempt in range(3):
+        try:
+            response = model.generate_content(f"{EXTRACTION_PROMPT}\n\n{combined}")
+            raw = response.text.strip()
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+            return json.loads(raw)
+        except Exception as e:
+            if "429" in str(e) and attempt < 2:
+                time.sleep(25)
+                continue
+            raise
 
 
-def parse_with_gemini_vision(page_images: list[Image.Image], api_key: str) -> list[dict]:
+def parse_with_gemini_vision(page_images: list[Image.Image], api_key: str, model_name: str) -> list[dict]:
     """Parse transactions from page images via Gemini vision."""
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-2.0-flash")
+    model = genai.GenerativeModel(model_name)
 
     content_parts = []
     for i, img in enumerate(page_images):
@@ -107,11 +122,18 @@ def parse_with_gemini_vision(page_images: list[Image.Image], api_key: str) -> li
         content_parts.append(img)
     content_parts.append(EXTRACTION_PROMPT)
 
-    response = model.generate_content(content_parts)
-    raw = response.text.strip()
-    raw = re.sub(r"^```(?:json)?\s*", "", raw)
-    raw = re.sub(r"\s*```$", "", raw)
-    return json.loads(raw)
+    for attempt in range(3):
+        try:
+            response = model.generate_content(content_parts)
+            raw = response.text.strip()
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+            return json.loads(raw)
+        except Exception as e:
+            if "429" in str(e) and attempt < 2:
+                time.sleep(25)
+                continue
+            raise
 
 
 def to_quickbooks_df(transactions: list[dict], detailed: bool = False) -> pd.DataFrame:
@@ -152,6 +174,12 @@ with st.sidebar:
         type="password",
         help="Get free at https://aistudio.google.com/apikey",
     )
+    selected_model = st.selectbox(
+        "Gemini Model",
+        options=list(AVAILABLE_MODELS.keys()),
+        format_func=lambda x: AVAILABLE_MODELS[x],
+        help="Try Flash Lite first — it has the best free quota. Switch if you get 429 errors.",
+    )
     detailed_export = st.checkbox("Include Check # and Type columns", value=True)
     force_vision = st.checkbox(
         "Force vision mode (use for scanned PDFs)",
@@ -162,7 +190,12 @@ with st.sidebar:
     st.markdown("""
     **💡 Free API Key**  
     Get yours at [aistudio.google.com/apikey](https://aistudio.google.com/apikey)  
-    Free tier: 15 req/min, 1M tokens/day
+    
+    **Troubleshooting 429 errors:**  
+    - Delete your key & create a new one  
+    - Use a personal Google account (not workspace)  
+    - Try a different model from the dropdown  
+    - Wait 30 seconds between requests  
     """)
     st.divider()
     st.markdown("""
@@ -214,15 +247,18 @@ if uploaded and api_key:
         with st.spinner("Gemini is parsing transactions..."):
             try:
                 if text_mode:
-                    transactions = parse_with_gemini_text(pdf_text, table_text, api_key)
+                    transactions = parse_with_gemini_text(pdf_text, table_text, api_key, selected_model)
                 else:
-                    transactions = parse_with_gemini_vision(page_images, api_key)
+                    transactions = parse_with_gemini_vision(page_images, api_key, selected_model)
                 st.success(f"Extracted **{len(transactions)}** transactions")
             except json.JSONDecodeError as e:
                 st.error(f"Failed to parse Gemini's response as JSON: {e}")
                 st.stop()
             except Exception as e:
-                st.error(f"API error: {e}")
+                if "429" in str(e):
+                    st.error(f"Rate limit hit on {selected_model}. Try selecting a different model in the sidebar, or wait 30 seconds and retry.")
+                else:
+                    st.error(f"API error: {e}")
                 st.stop()
 
         df = to_quickbooks_df(transactions, detailed=detailed_export)
